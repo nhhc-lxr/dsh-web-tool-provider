@@ -4,6 +4,17 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
+    // The primitives ship with the desktop shell. A missing or renamed export
+    // must never white-screen the settings page, so every control below has a
+    // plain-element twin and the wrappers only pass props we have verified in
+    // other plugins that use this package.
+    let primitives = {}
+    try {
+      primitives = require('@deepseek-ai/dsh-client-ui-primitives') || {}
+    } catch {
+      primitives = {}
+    }
+
     const ENDPOINT = '/web-tool-provider/state'
     const VENDORS = ['tavily', 'exa', 'firecrawl']
     const LABELS = { tavily: 'Tavily', exa: 'Exa', firecrawl: 'Firecrawl' }
@@ -13,9 +24,14 @@ window.__ModuleLoader__.load({
       en: {
         tab: 'Web tools',
         title: 'Web tool provider',
+        subtitle: 'One backend serves both web_search and web_fetch. When it fails, the next vendor in the chain is tried.',
         backends: 'Backends',
         searchBackend: 'web_search',
         fetchBackend: 'web_fetch',
+        fallback: 'Fallback',
+        fallbackNone: 'none',
+        chain: 'chain',
+        cooling: 'cooling down',
         keys: 'API keys',
         save: 'Save',
         clear: 'Clear',
@@ -40,9 +56,14 @@ window.__ModuleLoader__.load({
       zh: {
         tab: '网页工具',
         title: '网页工具后端',
+        subtitle: '一个后端同时服务 web_search 与 web_fetch；失败时自动按顺序换下一个。',
         backends: '后端选择',
         searchBackend: 'web_search',
         fetchBackend: 'web_fetch',
+        fallback: '自动回退',
+        fallbackNone: '无',
+        chain: '顺序',
+        cooling: '冷却中',
         keys: 'API 密钥',
         save: '保存',
         clear: '清除',
@@ -95,91 +116,185 @@ window.__ModuleLoader__.load({
       return (key) => dict[key] || DICT.en[key] || key
     }
 
+    /* ------------------------------------------------------------- styles -- */
+
     const styles = {
-      page: { padding: '4px 0 24px', maxWidth: 640, color: 'var(--dsw-alias-label-primary)' },
-      title: { margin: '0 0 14px', fontSize: 15, fontWeight: 600 },
-      card: {
-        border: '1px solid var(--dsw-alias-border-l1)',
-        borderRadius: 10,
-        background: 'var(--dsw-alias-bg-layer-1)',
-        padding: '14px 16px',
-        marginBottom: 14,
-      },
-      cardTitle: { margin: '0 0 12px', fontSize: 13, fontWeight: 600 },
-      row: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10, flexWrap: 'wrap' },
-      label: { fontSize: 12, minWidth: 130, color: 'var(--dsw-alias-label-secondary)' },
-      select: {
-        boxSizing: 'border-box',
-        flex: '1 1 180px',
-        minWidth: 150,
-        height: 30,
-        padding: '0 8px',
+      page: { padding: '4px 0 28px', maxWidth: 720, color: 'var(--dsw-alias-label-primary)' },
+      title: { margin: 0, fontSize: 15, fontWeight: 600, lineHeight: '22px' },
+      subtitle: {
+        margin: '4px 0 16px',
         fontSize: 12,
-        color: 'var(--dsw-alias-label-primary)',
-        background: 'var(--dsw-alias-bg-base)',
-        border: '1px solid var(--dsw-alias-border-l2)',
-        borderRadius: 7,
-      },
-      input: {
-        boxSizing: 'border-box',
-        flex: '1 1 220px',
-        minWidth: 170,
-        height: 30,
-        padding: '0 9px',
-        fontSize: 12,
-        color: 'var(--dsw-alias-label-primary)',
-        background: 'var(--dsw-alias-bg-base)',
-        border: '1px solid var(--dsw-alias-border-l2)',
-        borderRadius: 7,
-      },
-      button: {
-        boxSizing: 'border-box',
-        height: 30,
-        padding: '0 12px',
-        fontSize: 12,
-        color: 'var(--dsw-alias-label-primary)',
-        background: 'var(--dsw-alias-bg-layer-2)',
-        border: '1px solid var(--dsw-alias-border-l2)',
-        borderRadius: 7,
-        cursor: 'pointer',
-      },
-      primary: {
-        height: 30,
-        padding: '0 14px',
-        fontSize: 12,
-        color: 'var(--dsw-alias-bg-base)',
-        background: 'var(--dsw-alias-brand-primary)',
-        border: '1px solid var(--dsw-alias-brand-primary)',
-        borderRadius: 7,
-        cursor: 'pointer',
-      },
-      vendor: { fontSize: 12, fontWeight: 600, minWidth: 76 },
-      credits: { fontSize: 11, whiteSpace: 'nowrap', color: 'var(--dsw-alias-label-secondary)' },
-      badge: {
-        fontSize: 11,
-        padding: '2px 7px',
-        borderRadius: 999,
-        border: '1px solid currentColor',
-        whiteSpace: 'nowrap',
-      },
-      iconButton: {
-        boxSizing: 'border-box',
-        height: 30,
-        width: 30,
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 0,
-        background: 'transparent',
-        border: '1px solid var(--dsw-alias-border-l2)',
-        borderRadius: 7,
-        cursor: 'pointer',
+        lineHeight: 1.6,
         color: 'var(--dsw-alias-label-secondary)',
       },
-      note: { margin: '10px 0 0', fontSize: 11, lineHeight: 1.6, color: 'var(--dsw-alias-label-secondary)' },
-      error: { fontSize: 12, color: 'var(--dsw-alias-state-error-primary)' },
-      ok: { fontSize: 12, color: 'var(--dsw-alias-state-success-primary)' },
+      card: {
+        border: '1px solid var(--dsw-alias-border-l1)',
+        borderRadius: 12,
+        background: 'var(--dsw-alias-bg-layer-1)',
+        padding: '14px 16px 16px',
+        marginBottom: 12,
+      },
+      cardTitle: {
+        margin: '0 0 12px',
+        fontSize: 12,
+        fontWeight: 600,
+        letterSpacing: '0.02em',
+        color: 'var(--dsw-alias-label-secondary)',
+        textTransform: 'uppercase',
+      },
+      block: { display: 'grid', gap: 8, padding: '8px 0' },
+      blockDivider: { borderTop: '1px solid var(--dsw-alias-border-l1)' },
+      row: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32 },
+      label: { flex: '0 0 96px', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontFamily: 'ui-monospace, monospace' },
+      control: { flex: '1 1 auto', minWidth: 0 },
+      subrow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', paddingLeft: 108 },
+      caption: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' },
+      chain: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', fontFamily: 'ui-monospace, monospace' },
+      cooling: { margin: '4px 0 0', paddingLeft: 108, fontSize: 11, color: 'var(--dsw-alias-state-warning-primary)' },
+      keyRow: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1.3fr) auto',
+        alignItems: 'center',
+        gap: 12,
+        minHeight: 40,
+        padding: '4px 0',
+      },
+      keyIdent: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
+      vendor: { fontSize: 12, fontWeight: 600 },
+      keyStatus: {
+        fontSize: 11,
+        color: 'var(--dsw-alias-label-secondary)',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      },
+      keyBody: { display: 'flex', alignItems: 'center', minWidth: 0 },
+      keyActions: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' },
+      credits: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'nowrap' },
+      note: { margin: '8px 0 0', fontSize: 12, lineHeight: 1.6 },
+      error: { color: 'var(--dsw-alias-state-error-primary)' },
+      ok: { color: 'var(--dsw-alias-state-success-primary)' },
+      empty: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' },
     }
+
+    /* ---------------------------------------------------------- controls -- */
+
+    const fallbackButtonStyle = {
+      boxSizing: 'border-box',
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: 28,
+      padding: '0 12px',
+      fontSize: 12,
+      borderRadius: 7,
+      cursor: 'pointer',
+      color: 'var(--dsw-alias-label-primary)',
+      background: 'var(--dsw-alias-bg-layer-2)',
+      border: '1px solid var(--dsw-alias-border-l2)',
+    }
+
+    function Button({ variant, size, disabled, onClick, children }) {
+      if (primitives.Button) {
+        return h(primitives.Button, { variant, size, disabled, onClick }, children)
+      }
+      const style = disabled === true ? { ...fallbackButtonStyle, opacity: 0.5, cursor: 'default' } : fallbackButtonStyle
+      return h('button', { type: 'button', disabled, onClick, style }, children)
+    }
+
+    function Input({ value, placeholder, type, disabled, autoComplete, onChange }) {
+      if (primitives.Input) {
+        return h(primitives.Input, { value, placeholder, type, disabled, autoComplete, onChange })
+      }
+      return h('input', {
+        value,
+        placeholder,
+        type,
+        disabled,
+        autoComplete,
+        spellCheck: false,
+        onChange,
+        style: {
+          ...fallbackButtonStyle,
+          height: 28,
+          padding: '0 9px',
+          width: '100%',
+          cursor: 'text',
+          background: 'var(--dsw-alias-bg-base)',
+        },
+      })
+    }
+
+    /** Segmented choice for the active backend; falls back to a native select. */
+    function Segmented({ label, value, options, onChange }) {
+      // The primitive hands back the chosen value, a native select hands back
+      // the event: unwrap both so callers always see a vendor id.
+      const pick = (payload) => onChange(typeof payload === 'string' ? payload : payload?.target?.value)
+      if (primitives.SegmentedControl) {
+        return h(primitives.SegmentedControl, { label, value, options, onChange: pick })
+      }
+      return h(
+        'select',
+        {
+          value,
+          'aria-label': label,
+          onChange: pick,
+          style: {
+            ...fallbackButtonStyle,
+            height: 28,
+            padding: '0 8px',
+            cursor: 'pointer',
+            background: 'var(--dsw-alias-bg-base)',
+          },
+        },
+        options.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+      )
+    }
+
+    function Pill({ active, onClick, children }) {
+      if (primitives.Pill) return h(primitives.Pill, { active, onClick }, children)
+      return h(
+        'button',
+        {
+          type: 'button',
+          onClick,
+          style: {
+            ...fallbackButtonStyle,
+            height: 24,
+            padding: '0 10px',
+            borderRadius: 999,
+            ...(active
+              ? { border: '1px solid var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-brand-primary)' }
+              : { color: 'var(--dsw-alias-label-secondary)' }),
+          },
+        },
+        children,
+      )
+    }
+
+    const dotColors = {
+      done: 'var(--dsw-alias-state-success-primary)',
+      error: 'var(--dsw-alias-state-error-primary)',
+      warning: 'var(--dsw-alias-state-warning-primary)',
+      ongoing: 'var(--dsw-alias-brand-primary)',
+    }
+
+    function StateDot({ state, size = 8 }) {
+      if (primitives.StateDot) return h(primitives.StateDot, { state, size })
+      return h('span', {
+        'aria-hidden': 'true',
+        style: {
+          display: 'inline-block',
+          flex: '0 0 auto',
+          width: size,
+          height: size,
+          borderRadius: 999,
+          background: dotColors[state] || 'var(--dsw-alias-label-secondary)',
+        },
+      })
+    }
+
+    /* ------------------------------------------------------------- data -- */
 
     async function readState() {
       const response = await fetch(ENDPOINT, { headers: { accept: 'application/json' } })
@@ -198,31 +313,6 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    const ICONS = {
-      edit: ['M11.3 2.4a1.7 1.7 0 0 1 2.4 2.4L5.9 12.6l-3.3.6.6-3.3z'],
-      trash: ['M2.8 4.4h10.4', 'M6.4 4.4V2.9h3.2v1.5', 'M4.3 4.4l.7 8.1h6l.7-8.1'],
-      check: ['M3.1 8.4l3.2 3.2 6.6-6.8'],
-      close: ['M4.2 4.2l7.6 7.6', 'M11.8 4.2l-7.6 7.6'],
-    }
-
-    function Icon({ name }) {
-      return h(
-        'svg',
-        {
-          viewBox: '0 0 16 16',
-          width: 14,
-          height: 14,
-          fill: 'none',
-          stroke: 'currentColor',
-          strokeWidth: 1.5,
-          strokeLinecap: 'round',
-          strokeLinejoin: 'round',
-          'aria-hidden': 'true',
-        },
-        (ICONS[name] || []).map((d, index) => h('path', { key: index, d })),
-      )
-    }
-
     const clone = (value) => JSON.parse(JSON.stringify(value))
     const formatNumber = (value) => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 
@@ -236,27 +326,29 @@ window.__ModuleLoader__.load({
       if (entry.used !== undefined) return `${t('creditsUsed')} ${formatNumber(entry.used)}`
       return '—'
     }
-    const splitDomains = (value) =>
-      String(value)
-        .split(/[\s,]+/)
-        .map((entry) => entry.trim())
-        .filter(Boolean)
 
-    function badgeStyle(kind) {
-      if (kind === 'no') return { ...styles.badge, color: 'var(--dsw-alias-state-error-primary)' }
-      return { ...styles.badge, color: 'var(--dsw-alias-state-success-primary)' }
+    function keyStatusText(t, key) {
+      if (!key || key.configured !== true) return t('missing')
+      if (key.source === 'env') return `${t('configured')} · ${t('fromEnv')}`
+      if (key.source === 'config') return `${t('configured')} · ${t('fromConfig')}`
+      return t('configured')
     }
 
-    function keyBadge(t, key) {
-      const configured = key && key.configured
-      const source = key && key.source
-      let label = configured ? t('configured') : t('missing')
-      if (configured && source === 'env') label = `${t('configured')} · ${t('fromEnv')}`
-      else if (configured && source === 'config') label = `${t('configured')} · ${t('fromConfig')}`
-      return h('span', { style: badgeStyle(configured ? 'yes' : 'no') }, label)
+    const orderOf = (state, kind) => {
+      const list = state && state[kind] && state[kind].fallbackOrder
+      return Array.isArray(list) ? list.filter((vendor) => VENDORS.includes(vendor)) : []
     }
 
-    function ProviderPage() {
+    const chainOf = (state, kind) => {
+      const backend = state && state[kind] ? state[kind].backend : undefined
+      return [backend, ...orderOf(state, kind).filter((vendor) => vendor !== backend)].filter(
+        (vendor) => VENDORS.includes(vendor),
+      )
+    }
+
+    function ProviderPage(props) {
+      const ctx = props.ctx
+      const t = React.useMemo(() => createTranslate(ctx), [ctx])
       const [state, setState] = React.useState(null)
       const [error, setError] = React.useState('')
       const [busy, setBusy] = React.useState(false)
@@ -264,7 +356,6 @@ window.__ModuleLoader__.load({
       const [draftKeys, setDraftKeys] = React.useState({})
       const [editingKeys, setEditingKeys] = React.useState({})
       const [credits, setCredits] = React.useState({})
-      const t = React.useMemo(() => createTranslate({ get: () => undefined }), [])
 
       const stateRef = React.useRef(null)
       const timerRef = React.useRef(null)
@@ -325,11 +416,7 @@ window.__ModuleLoader__.load({
           try {
             const payload = await writeState(body)
             setError('')
-            setState((current) =>
-              current
-                ? { ...current, keys: payload.keys || current.keys }
-                : current,
-            )
+            setState((current) => (current ? { ...current, keys: payload.keys || current.keys } : current))
             if (payload.persistence && payload.persistence.persisted === false) {
               setNotice(`${t('localOnly')}${payload.persistence.reason || ''}`)
             } else {
@@ -342,10 +429,6 @@ window.__ModuleLoader__.load({
         [t],
       )
 
-      const snapshotBody = (current) => ({
-        search: { backend: current.search.backend },
-        fetch: { backend: current.fetch.backend },
-      })
       const edit = (mutate) => {
         const next = clone(stateRef.current)
         mutate(next)
@@ -354,7 +437,22 @@ window.__ModuleLoader__.load({
         return next
       }
 
-      const saveNow = (next) => commit(snapshotBody(next))
+      const setBackend = (kind, vendor) => {
+        const next = edit((draft) => {
+          draft[kind].backend = vendor
+          draft[kind].fallbackOrder = orderOf(draft, kind).filter((entry) => entry !== vendor)
+        })
+        commit({ [kind]: { backend: vendor, fallbackOrder: next[kind].fallbackOrder } })
+      }
+
+      const toggleFallback = (kind, vendor) => {
+        const current = orderOf(stateRef.current, kind)
+        const next = current.includes(vendor) ? current.filter((entry) => entry !== vendor) : [...current, vendor]
+        edit((draft) => {
+          draft[kind].fallbackOrder = next
+        })
+        commit({ [kind]: { fallbackOrder: next } })
+      }
 
       const applyKeys = React.useCallback(
         async (body, kind) => {
@@ -383,71 +481,57 @@ window.__ModuleLoader__.load({
       )
 
       if (state === null && error === '') {
-        return h('div', { style: styles.page }, h('p', { style: styles.note }, t('loading')))
+        return h('div', { style: styles.page }, h('p', { style: styles.empty }, t('loading')))
       }
       if (state === null) {
         return h('div', { style: styles.page }, h('p', { style: styles.error }, `${t('loadFailed')}${error}`))
       }
 
-      const optionTag = (value) => h('option', { key: value, value }, labelOf(value))
-
-      const backends = h(
-        'div',
-        { style: styles.card },
-        h('h3', { style: styles.cardTitle }, t('backends')),
-        h(
+      const backendBlock = (kind, nameKey) => {
+        const chain = chainOf(state, kind)
+        const primary = state[kind] ? state[kind].backend : chain[0]
+        const options = VENDORS.map((vendor) => ({ value: vendor, label: labelOf(vendor) }))
+        const candidates = VENDORS.filter((vendor) => vendor !== primary)
+        return h(
           'div',
-          { style: styles.row },
-          h('span', { style: styles.label }, t('searchBackend')),
+          { style: styles.block },
           h(
-            'select',
-            {
-              style: styles.select,
-              value: state.search.backend,
-              onChange: (event) =>
-                saveNow(
-                  edit((next) => {
-                    next.search.backend = event.target.value
-                  }),
-                ),
-            },
-            VENDORS.map(optionTag),
+            'div',
+            { style: styles.row },
+            h('span', { style: styles.label }, t(nameKey)),
+            h(
+              'div',
+              { style: styles.control },
+              h(Segmented, {
+                label: t(nameKey),
+                value: primary,
+                options,
+                onChange: (vendor) => setBackend(kind, vendor),
+              }),
+            ),
           ),
-        ),
-        h(
-          'div',
-          { style: styles.row },
-          h('span', { style: styles.label }, t('fetchBackend')),
           h(
-            'select',
-            {
-              style: styles.select,
-              value: state.fetch.backend,
-              onChange: (event) =>
-                saveNow(
-                  edit((next) => {
-                    next.fetch.backend = event.target.value
-                  }),
-                ),
-            },
-            VENDORS.map(optionTag),
+            'div',
+            { style: styles.subrow },
+            h('span', { style: styles.caption }, t('fallback')),
+            candidates.map((vendor) =>
+              h(
+                Pill,
+                { key: vendor, active: orderOf(state, kind).includes(vendor), onClick: () => toggleFallback(kind, vendor) },
+                labelOf(vendor),
+              ),
+            ),
+            h('span', { style: styles.chain }, `${t('chain')}: ${chain.map(labelOf).join(' → ')}`),
           ),
-        ),
-      )
-
-      const iconButton = (name, label, onClick, options = {}) =>
-        h(
-          'button',
-          {
-            type: 'button',
-            style: { ...styles.iconButton, color: options.color || styles.iconButton.color },
-            title: label,
-            'aria-label': label,
-            disabled: options.disabled === true,
-            onClick,
-          },
-          h(Icon, { name }),
         )
+      }
+
+      const cooling = (state.fallback && Array.isArray(state.fallback.cooling) ? state.fallback.cooling : []).map(
+        (entry) => {
+          const seconds = Math.max(1, Math.round((entry.remainingMs || 0) / 1000))
+          return `${labelOf(entry.vendor)} ${seconds}s (${entry.code})`
+        },
+      )
 
       const keyRows = VENDORS.map((vendor) => {
         const key = (state.keys && state.keys[vendor]) || {}
@@ -458,49 +542,84 @@ window.__ModuleLoader__.load({
 
         if (editing) {
           actions.push(
-            iconButton('check', t('save'), () => applyKeys({ setKey: { vendor, value: draft.trim() } }, 'saved'), {
-              color: 'var(--dsw-alias-brand-primary)',
-              disabled: busy || draft.trim() === '',
-            }),
+            h(
+              Button,
+              {
+                key: 'save',
+                size: 'sm',
+                variant: 'primary',
+                disabled: busy || draft.trim() === '',
+                onClick: () => applyKeys({ setKey: { vendor, value: draft.trim() } }, 'saved'),
+              },
+              t('save'),
+            ),
           )
           if (configured) {
             actions.push(
-              iconButton('close', t('cancel'), () => setEditingKeys((current) => ({ ...current, [vendor]: false }))),
+              h(
+                Button,
+                {
+                  key: 'cancel',
+                  size: 'sm',
+                  variant: 'outline',
+                  onClick: () => setEditingKeys((current) => ({ ...current, [vendor]: false })),
+                },
+                t('cancel'),
+              ),
             )
           }
         } else {
           actions.push(
-            iconButton('edit', t('edit'), () => setEditingKeys((current) => ({ ...current, [vendor]: true }))),
-            iconButton('trash', t('clear'), () => applyKeys({ clearKey: { vendor } }, 'cleared'), {
-              color: 'var(--dsw-alias-state-error-primary)',
-              disabled: busy,
-            }),
+            h(
+              Button,
+              {
+                key: 'edit',
+                size: 'sm',
+                variant: 'outline',
+                onClick: () => setEditingKeys((current) => ({ ...current, [vendor]: true })),
+              },
+              t('edit'),
+            ),
+            h(
+              Button,
+              {
+                key: 'clear',
+                size: 'sm',
+                variant: 'outline',
+                disabled: busy,
+                onClick: () => applyKeys({ clearKey: { vendor } }, 'cleared'),
+              },
+              t('clear'),
+            ),
           )
         }
 
         return h(
           'div',
-          { key: vendor, style: { ...styles.row, flexWrap: 'nowrap', height: 34, marginBottom: 4 } },
-          h('span', { style: styles.vendor }, labelOf(vendor)),
-          keyBadge(t, key),
-          editing
-            ? h('input', {
-                key: 'input',
-                style: { ...styles.input, flex: '1 1 160px', minWidth: 130 },
-                type: 'password',
-                autoComplete: 'off',
-                spellCheck: false,
-                placeholder: `${t('keyPlaceholder')} (${key.ref || vendor})`,
-                value: draft,
-                disabled: busy,
-                onChange: (event) => setDraftKeys({ ...draftKeys, [vendor]: event.target.value }),
-              })
-            : h('span', { key: 'credits', style: styles.credits }, creditsText(t, credits[vendor])),
+          { key: vendor, style: styles.keyRow },
           h(
             'div',
-            { style: { display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flex: '0 0 auto' } },
-            ...actions,
+            { style: styles.keyIdent },
+            h(StateDot, { state: configured ? 'done' : 'error', size: 8 }),
+            h('span', { style: styles.vendor }, labelOf(vendor)),
+            h('span', { style: styles.keyStatus }, keyStatusText(t, key)),
           ),
+          h(
+            'div',
+            { style: styles.keyBody },
+            editing
+              ? h(Input, {
+                  key: 'input',
+                  type: 'password',
+                  autoComplete: 'off',
+                  placeholder: `${t('keyPlaceholder')} (${key.ref || vendor})`,
+                  value: draft,
+                  disabled: busy,
+                  onChange: (event) => setDraftKeys({ ...draftKeys, [vendor]: event.target.value }),
+                })
+              : h('span', { key: 'credits', style: styles.credits }, creditsText(t, credits[vendor])),
+          ),
+          h('div', { style: styles.keyActions }, ...actions),
         )
       })
 
@@ -508,10 +627,21 @@ window.__ModuleLoader__.load({
         'div',
         { style: styles.page },
         h('h2', { style: styles.title }, t('title')),
-        backends,
-        h('div', { style: styles.card }, h('h3', { style: styles.cardTitle }, t('keys')), keyRows),
-        notice === '' ? null : h('p', { style: styles.ok }, notice),
-        error === '' ? null : h('p', { style: styles.error }, error),
+        h('p', { style: styles.subtitle }, t('subtitle')),
+        h(
+          'div',
+          { style: styles.card },
+          h('h3', { style: styles.cardTitle }, t('backends')),
+          backendBlock('search', 'searchBackend'),
+          h('div', { style: styles.blockDivider }),
+          backendBlock('fetch', 'fetchBackend'),
+          cooling.length === 0
+            ? null
+            : h('p', { style: styles.cooling }, `${t('cooling')}: ${cooling.join(' · ')}`),
+        ),
+        h('div', { style: styles.card }, h('h3', { style: styles.cardTitle }, t('keys')), ...keyRows),
+        notice === '' ? null : h('p', { style: { ...styles.note, ...styles.ok } }, notice),
+        error === '' ? null : h('p', { style: { ...styles.note, ...styles.error } }, error),
       )
     }
 
@@ -526,7 +656,7 @@ window.__ModuleLoader__.load({
               order: 65,
               label: () => createTranslate(ctx)('tab'),
             },
-            ProviderPage,
+            (props) => h(ProviderPage, { ...props, ctx }),
           ),
         )
       },

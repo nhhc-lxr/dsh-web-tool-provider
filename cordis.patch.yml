@@ -8,12 +8,23 @@
 # dispatches to tavily / exa / firecrawl according to `searchBackend` and
 # `fetchBackend` below. Switching backends therefore does not touch this file —
 # the settings page writes those two fields through the config editor.
+#
+# `searchFallbackOrder` / `fetchFallbackOrder` are only first-run defaults: the
+# chain is `backend` first, then this order, deduped. The settings page stores
+# its own copy in the plugin state file, which wins over this YAML.
 - insert:
     - id: web-tool-provider
       name: 'dsh-web-tool-provider'
       config:
         searchBackend: tavily
         fetchBackend: firecrawl
+        searchFallbackOrder:
+          - exa
+          - firecrawl
+        fetchFallbackOrder:
+          - exa
+          - tavily
+        fallbackBudgetMs: 60000
         fallbackToHttp: true
 
 - id: web

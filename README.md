@@ -11,6 +11,7 @@ web_fetch  ─┘   （本插件负责转换）        └─ exa / firecrawl
 - **输入归一**：通用层只有域名白/黑名单；每次查询固定 5 条；其余厂商参数（深度、主题、格式、地区……）全部由插件内部的默认值决定，界面不暴露。
 - **输出归一**：一个 source 形状、一种日期格式、一套错误码；厂商的 `author`/`warnings`/`failed_results` 都折进同一处。
 - **不向厂商索要答案或逐条正文**：Tavily 的 `include_answer` 与 Exa 的 `contents.highlights` 都关闭，`content` 只承载降级 notice，正文一律走 `web_fetch`。
+- **失败自动回退**：主后端限流/额度/超时/5xx/连不上时，按配置的链换下一家重试；被限流的后端进入冷却，在此期间不会被再次请求。
 
 ## 安装
 
@@ -20,20 +21,25 @@ dsh plugin --profile web add github:nhhc-lxr/dsh-web-tool-provider
 
 ## 设置页
 
-**Settings → Plugins → 网页工具后端**，一页三块：
+**Settings → Plugins → 网页工具后端**，一页两块：
 
 ```text
-┌ 后端选择 ─────────────────────────┐
-│ web_search   [ Tavily    ▾ ]      │
-│ web_fetch    [ Firecrawl ▾ ]      │
-├ API 密钥 ─────────────────────────┤
-│ Tavily     [已配置]  ✎  🗑          │
-│ Exa        [未配置]  [____]  ✓     │
-│ Firecrawl  [已配置]  ✎  🗑          │
-└──────────────────────────────────┘
+┌ 后端选择 ─────────────────────────────────────┐
+│ web_search  [Tavily│Exa│Firecrawl]            │
+│   自动回退  (Exa) (Firecrawl)  顺序: tavily → exa│
+│ web_fetch   [Tavily│Exa│Firecrawl]            │
+│   自动回退  (Exa) (Firecrawl)  顺序: firecrawl → exa│
+│   冷却中: Exa 45s (WEB_PROVIDER_RATE_LIMITED)  │
+├ API 密钥 ─────────────────────────────────────┤
+│ ● Tavily    已配置 · 来自环境变量   编辑  清除   │
+│ ● Exa       未配置  [____粘贴密钥____]  保存    │
+│ ● Firecrawl 已配置 · 已配置       剩余 42,000  │
+└───────────────────────────────────────────────┘
 ```
 
-没有保存按钮：两个下拉**改动即存**。密钥显式保存（避免输一半就被写进凭据库）：已配置的行隐藏输入框，点铅笔才展开，同时在输入框左边显示剩余额度。
+后端是分段选择，**改动即存**；回退顺序用标签点选（点一下加入链尾，再点一下移出）。密钥显式保存（避免输一半就被写进凭据库）：已配置的行隐藏输入框，点「编辑」才展开，同时在输入框位置显示剩余额度。
+
+界面控件用 `@deepseek-ai/dsh-client-ui-primitives`，颜色全部走 `--dsw-alias-*` 设计令牌，与 DSH 自带页面同一套组件；任一导出缺失时自动退回原生控件，不会白屏。
 
 额度查询直连厂商接口（不经 `ctx.web`、不经工具层）：
 
@@ -51,13 +57,38 @@ dsh plugin --profile web add github:nhhc-lxr/dsh-web-tool-provider
 
 | 层 | 字段 |
 |---|---|
-| `search` | `backend`、`includeDomains`、`excludeDomains` |
-| `fetch` | `backend`、`fallbackToHttp` |
+| `search` | `backend`、`fallbackOrder`、`includeDomains`、`excludeDomains` |
+| `fetch` | `backend`、`fallbackOrder`、`fallbackToHttp` |
+| `fallback` | `budgetMs`（一次工具调用走完整条链的总预算，默认 60000） |
 | `providers.tavily` | `baseURL`、`timeoutMs`、`maxChars`、`topic`、`searchDepth`、`apiKey`、`apiKeyEnv` |
 | `providers.exa` | `baseURL`、`timeoutMs`、`maxChars`、`searchType`、`apiKey`、`apiKeyEnv` |
 | `providers.firecrawl` | `baseURL`、`timeoutMs`、`maxChars`、`version`、`mainContent`、`maxAge`、`apiKey`、`apiKeyEnv` |
 
+YAML 里的写法就是 Config 的键名：`searchFallbackOrder: [exa, tavily]`、`fetchFallbackOrder: [tavily]`、`fallbackBudgetMs: 45000`。
+
 后端与通用选项存在插件自管状态文件（`<profile>/.web-tool-provider/state.json`，回退 `$DSH_HOME`、`~/.dsh`）；状态文件优先于 Config。
+
+## 失败自动回退
+
+链 = `当前后端` + `回退顺序`（去重、只认已知厂商）。逐跳规则：
+
+| 厂商返回 | 错误码 | 处理 |
+|---|---|---|
+| 429 | `WEB_PROVIDER_RATE_LIMITED` | 冷却 60s，换下一家 |
+| 401 / 403 | `WEB_PROVIDER_UNAUTHORIZED` | 冷却 10 分钟，换下一家（改了密钥立即解除） |
+| 402 / 额度 | `WEB_PROVIDER_QUOTA_EXCEEDED` | 冷却 10 分钟，换下一家 |
+| 5xx | `WEB_PROVIDER_UPSTREAM` | 冷却 30s，换下一家 |
+| 超时 / 连不上 | `WEB_FETCH_TIMEOUT` / `WEB_PROVIDER_UNREACHABLE` | 冷却 30s，换下一家 |
+| 空结果 / 没配密钥 | `WEB_PROVIDER_EMPTY` / `_CREDENTIAL_MISSING` | 换下一家（不冷却） |
+| 400 / 422 | `WEB_PROVIDER_BAD_REQUEST` | **不换**，直接报错（参数错了换谁都没用） |
+| 非法 URL / 被拦地址 / 重定向越界 / 不支持的类型 | `WEB_INVALID_URL` 等 | **不换**，直接报错 |
+| 用户 abort | `WEB_ABORTED` | **立即停止**整条链 |
+
+- 冷却按 `(能力, 厂商)` 分开记：搜索被限流不影响抓取，反之亦然。
+- 整条链共享一个 `budgetMs` 预算：前一家慢掉 50 秒，下一家只剩 10 秒，不会 3 家各等 60 秒。
+- 换过家之后结果里会附一行 notice：`> provider notice: fell back to exa after tavily WEB_PROVIDER_RATE_LIMITED`；被跳过时也会说明 `tavily is cooling down for 43s after ...`。
+- 全链都在冷却 → 直接报 `every search backend is cooling down: tavily 43s (...), exa 12s (...)`，不再发请求。
+- 抓取端仍然保留最后一层本地降级：整条链都失败且 `fallbackToHttp` 打开时，走本地 HTTP 抓取并附 notice。
 
 ## 输出契约
 
@@ -86,16 +117,16 @@ FetchResult  = { url: string; statusCode: number; body: { kind: 'text' | 'html';
 
 - **`web_search` 多 query = 多次厂商调用**（工具层并发 fan-out 后合并）。
 - **抓取结果一律 `text`**：三家给的都是 markdown/文本，标成 `html` 会让工具层再转一遍。
-- **抓取降级**：厂商报错/额度/无密钥/空正文/超时 → 本地抓取并附带 notice；目标页 4xx 是结果不降级；abort 不降级。
-- **搜索不降级**：选中的后端没配密钥就报 `WEB_PROVIDER_CREDENTIAL_MISSING`。
+- **抓取降级**：整条链报错/额度/无密钥/空正文/超时 → 本地抓取并附带 notice；目标页 4xx 是结果不降级；abort 不降级。
+- **搜索**：主后端失败按链换人；链上都没配密钥才报 `WEB_PROVIDER_CREDENTIAL_MISSING`。
 
 本地抓取只做协议白名单、明文内网/回环地址拦截、逐跳重定向校验与字节上限，**没有**官方 `dsh-web-fetch-http` 的 DNS 解析+公网校验+连接钉扎。要那层保护就关掉 `fallbackToHttp`。
 
 ## 开发
 
-- `index.js`：两层设置 + 归一化层 + 两个 provider + 两条 Host 路由，零第三方依赖。
-- `client.js`：设置页（两个下拉 + 通用选项 + 三家密钥）。
-- `node test/smoke.mjs`：20 项离线测试。
+- `index.js`：两层设置 + 归一化层 + 回退链（分类/冷却/预算）+ 两个 provider + 两条 Host 路由，零第三方依赖。
+- `client.js`：设置页（分段选择 + 回退标签 + 三家密钥），控件用 DSH UI primitives 并带原生兜底。
+- `node test/smoke.mjs`：25 项离线测试。
 
 > 改完代码需要**重启一次** Harness 才会加载新的 host 实现；设置页刷新页面即可。
 

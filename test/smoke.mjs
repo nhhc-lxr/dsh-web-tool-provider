@@ -311,6 +311,65 @@ await check('the fallback switch is honoured', async () => {
   })
 })
 
+/* --------------------------------------------------------- fallback chain -- */
+
+await check('a rate-limited vendor hands over to the next one and says so', async () => {
+  stubFetch((url) =>
+    url.includes('tavily')
+      ? json({ detail: { error: 'rate limited' } }, 429)
+      : json({ results: [{ title: 'E', url: 'https://e.test/1', text: 'from exa' }] }),
+  )
+  const { registry } = harness({ ...KEYS, searchFallbackOrder: ['exa'] })
+  const out = await registry.search.search({ query: 'q' })
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].url, 'https://api.tavily.com/search')
+  assert.equal(calls[1].url, 'https://api.exa.ai/search')
+  assert.equal(out.sources[0].url, 'https://e.test/1')
+  assert.match(out.content, /> provider notice: fell back to exa after tavily WEB_PROVIDER_RATE_LIMITED/)
+})
+
+await check('a bad request is not retried on another vendor', async () => {
+  stubFetch(() => json({ detail: 'bad' }, 400))
+  const { registry } = harness({ ...KEYS, searchFallbackOrder: ['exa'] })
+  await assert.rejects(registry.search.search({ query: 'q' }), (error) => {
+    assert.equal(error.code, 'WEB_PROVIDER_BAD_REQUEST')
+    return true
+  })
+  assert.equal(calls.length, 1, 'a 400 must not fan out to the fallback vendors')
+})
+
+await check('an aborted call ends the chain instead of retrying', async () => {
+  stubFetch(() => json(TAVILY))
+  const { registry } = harness({ ...KEYS, searchFallbackOrder: ['exa'] })
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(registry.search.search({ query: 'q' }, controller.signal), (error) => {
+    assert.equal(error.code, 'WEB_ABORTED')
+    return true
+  })
+  assert.equal(calls.length, 0, 'an already-aborted call must not reach the network at all')
+})
+
+await check('vendors that are cooling down are skipped, not hammered', async () => {
+  stubFetch(() => json({ detail: 'slow down' }, 429))
+  const { registry, route } = harness({ ...KEYS, searchFallbackOrder: ['exa'] })
+  await assert.rejects(registry.search.search({ query: 'q' }), (error) => {
+    assert.equal(error.code, 'WEB_PROVIDER_RATE_LIMITED')
+    return true
+  })
+  assert.equal(calls.length, 2, 'both vendors were tried once')
+
+  const cooling = await call(route, {})
+  assert.equal(cooling.payload.fallback.cooling.length, 2)
+  assert.equal(cooling.payload.fallback.budgetMs, 60000)
+
+  await assert.rejects(registry.search.search({ query: 'q' }), (error) => {
+    assert.match(error.message, /every search backend is cooling down: tavily \d+s \(WEB_PROVIDER_RATE_LIMITED\), exa \d+s/)
+    return true
+  })
+  assert.equal(calls.length, 2, 'a cooling vendor must not reach the network again')
+})
+
 /* ----------------------------------------------------------------- state -- */
 
 await check('GET exposes the two layers and the key state', async () => {

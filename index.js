@@ -45,6 +45,40 @@ const SNIPPET_CHARS = 400
 /** Results asked of every backend, per query. Fixed on purpose: no setting. */
 const RESULTS_PER_QUERY = 5
 
+/**
+ * Which failures are worth another vendor's time. A bad request or a blocked
+ * URL fails the same way everywhere, so replaying it only burns quota; a rate
+ * limit or an outage is exactly what a fallback is for.
+ */
+const RETRYABLE_CODES = new Set([
+  'WEB_PROVIDER_RATE_LIMITED',
+  'WEB_PROVIDER_QUOTA_EXCEEDED',
+  'WEB_PROVIDER_UNAUTHORIZED',
+  'WEB_PROVIDER_UPSTREAM',
+  'WEB_PROVIDER_UNREACHABLE',
+  'WEB_PROVIDER_EMPTY',
+  'WEB_PROVIDER_CREDENTIAL_MISSING',
+  'WEB_FETCH_TIMEOUT',
+])
+const NON_RETRYABLE_CODES = new Set([
+  'WEB_PROVIDER_BAD_REQUEST',
+  'WEB_INVALID_URL',
+  'WEB_BLOCKED_URL',
+  'WEB_REDIRECT_BLOCKED',
+  'WEB_UNSUPPORTED_CONTENT_TYPE',
+])
+const TERMINAL_CODES = new Set(['WEB_ABORTED'])
+
+/** How long a vendor sits out after each kind of failure. Zero = no rest. */
+const COOLDOWN_MS = {
+  WEB_PROVIDER_RATE_LIMITED: 60_000,
+  WEB_PROVIDER_QUOTA_EXCEEDED: 10 * 60_000,
+  WEB_PROVIDER_UNAUTHORIZED: 10 * 60_000,
+  WEB_PROVIDER_UPSTREAM: 30_000,
+  WEB_PROVIDER_UNREACHABLE: 30_000,
+  WEB_FETCH_TIMEOUT: 30_000,
+}
+
 export const name = PLUGIN
 export const inject = ['web', 'webServer']
 
@@ -137,6 +171,17 @@ function domainList(value) {  const parts = Array.isArray(value) ? value : text(
   return [...seen]
 }
 
+/** Fallback order: known vendors only, in the order given, each at most once. */
+function vendorList(value) {
+  const parts = Array.isArray(value) ? value : text(value).split(/[\s,]+/)
+  const seen = new Set()
+  for (const part of parts) {
+    const vendor = text(part).toLowerCase()
+    if (VENDORS.includes(vendor) && !seen.has(vendor)) seen.add(vendor)
+  }
+  return [...seen]
+}
+
 /* ---------------------------------------------------------------- settings -- */
 
 /** Static Config supplies first-run defaults; the state file overrides them. */
@@ -144,6 +189,7 @@ function defaultsFromConfig(config) {
   return {
     search: {
       backend: oneOf(config.searchBackend, VENDORS, 'tavily'),
+      fallbackOrder: vendorList(config.searchFallbackOrder),
       options: {
         includeDomains: domainList(config.includeDomains),
         excludeDomains: domainList(config.excludeDomains),
@@ -151,6 +197,7 @@ function defaultsFromConfig(config) {
     },
     fetch: {
       backend: oneOf(config.fetchBackend, VENDORS, 'firecrawl'),
+      fallbackOrder: vendorList(config.fetchFallbackOrder),
       options: { fallbackToHttp: asBoolean(config.fallbackToHttp, true) },
     },
     providers: {
@@ -183,6 +230,8 @@ function defaultsFromConfig(config) {
       },
     },
     fallback: {
+      /** Total time one tool call may spend walking the chain. */
+      budgetMs: asInteger(config.fallbackBudgetMs, 60000, 1000, MAX_TIMER_MS),
       timeoutMs: asInteger(config.fallbackTimeoutMs, 20000, 1000, MAX_TIMER_MS),
       maxChars: asInteger(config.fallbackMaxChars, 100000, 1000, 5000000),
       maxBytes: asInteger(config.fallbackMaxBytes, 5000000, 1000, 50000000),
@@ -205,9 +254,15 @@ function mergeSettings(base, patch) {
   if (typeof patch.search?.backend === 'string') {
     next.search.backend = oneOf(patch.search.backend, VENDORS, next.search.backend)
   }
+  if (Array.isArray(patch.search?.fallbackOrder)) {
+    next.search.fallbackOrder = vendorList(patch.search.fallbackOrder)
+  }
 
   if (typeof patch.fetch?.backend === 'string') {
     next.fetch.backend = oneOf(patch.fetch.backend, VENDORS, next.fetch.backend)
+  }
+  if (Array.isArray(patch.fetch?.fallbackOrder)) {
+    next.fetch.fallbackOrder = vendorList(patch.fetch.fallbackOrder)
   }
 
   return next
@@ -309,8 +364,8 @@ function persistSettings(settings) {
       mkdirSync(dirname(file), { recursive: true })
       const temporary = `${file}.tmp`
       const payload = {
-        search: { backend: settings.search.backend },
-        fetch: { backend: settings.fetch.backend },
+        search: { backend: settings.search.backend, fallbackOrder: settings.search.fallbackOrder },
+        fetch: { backend: settings.fetch.backend, fallbackOrder: settings.fetch.fallbackOrder },
         updatedAt: new Date().toISOString(),
       }
       writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`)
@@ -475,6 +530,147 @@ function composeAnswer(answer, notices) {
   if (answer !== '') blocks.push(answer)
   for (const notice of notices) blocks.push(`> provider notice: ${notice}`)
   return blocks.length === 0 ? undefined : blocks.join('\n\n')
+}
+
+/* ---------------------------------------------------------- fallback chain -- */
+
+const cooldownId = (kind, vendor) => `${kind}:${vendor}`
+
+function cooldownOf(state, kind, vendor) {
+  const entry = state.cooldowns.get(cooldownId(kind, vendor))
+  if (entry === undefined) return undefined
+  if (entry.until <= Date.now()) {
+    state.cooldowns.delete(cooldownId(kind, vendor))
+    return undefined
+  }
+  return entry
+}
+
+/** A vendor that just failed sits out; zero-length codes are not remembered. */
+function markCooling(state, kind, vendor, code) {
+  const ms = COOLDOWN_MS[code] ?? 0
+  if (ms <= 0) {
+    state.cooldowns.delete(cooldownId(kind, vendor))
+    return
+  }
+  state.cooldowns.set(cooldownId(kind, vendor), { until: Date.now() + ms, code })
+}
+
+/** A working key clears its vendor's record for both capabilities. */
+function clearCooling(state, vendor) {
+  for (const kind of ['search', 'fetch']) state.cooldowns.delete(cooldownId(kind, vendor))
+}
+
+/** Primary first, then the configured order; a vendor is never tried twice. */
+function chainFor(settings, kind) {
+  const chain = []
+  for (const vendor of [settings[kind].backend, ...settings[kind].fallbackOrder]) {
+    if (VENDORS.includes(vendor) && !chain.includes(vendor)) chain.push(vendor)
+  }
+  return chain
+}
+
+function activeCooling(state) {
+  const now = Date.now()
+  const list = []
+  for (const [id, entry] of state.cooldowns) {
+    if (entry.until <= now) {
+      state.cooldowns.delete(id)
+      continue
+    }
+    const [kind, vendor] = id.split(':')
+    list.push({ kind, vendor, code: entry.code, remainingMs: entry.until - now })
+  }
+  return list
+}
+
+function describeCooldown(entry) {
+  const seconds = Math.max(1, Math.ceil((entry.until - Date.now()) / 1000))
+  return `${entry.vendor} is cooling down for ${seconds}s after ${entry.code}`
+}
+
+function pushFallbackNotices(notices, attempts, skipped, vendor) {
+  for (const entry of skipped ?? []) notices.push(describeCooldown(entry))
+  if (vendor !== undefined && attempts !== undefined && attempts.length > 0) {
+    const trail = attempts.map((entry) => `${entry.vendor} ${entry.code}`).join(', ')
+    notices.push(`fell back to ${vendor} after ${trail}`)
+  }
+}
+
+/**
+ * Walk the chain until one vendor answers. Every hop gets what is left of a
+ * shared budget, so three dead vendors cost one timeout instead of three.
+ */
+async function runChain({ state, settings, kind, signal, run }) {
+  const chain = chainFor(settings, kind)
+  const budgetMs = settings.fallback.budgetMs
+  const startedAt = Date.now()
+  const attempts = []
+  const skipped = []
+  let lastError
+  let exhausted = false
+
+  for (const vendor of chain) {
+    const cooling = cooldownOf(state, kind, vendor)
+    if (cooling !== undefined) {
+      skipped.push({ vendor, ...cooling })
+      continue
+    }
+    const remaining = budgetMs - (Date.now() - startedAt)
+    if (remaining <= 250) {
+      exhausted = true
+      break
+    }
+
+    let ranOut = false
+    const controller = new AbortController()
+    const forwardAbort = () => controller.abort(signal?.reason)
+    if (signal?.aborted) forwardAbort()
+    else signal?.addEventListener('abort', forwardAbort, { once: true })
+    const timer = setTimeout(() => {
+      ranOut = true
+      controller.abort()
+    }, remaining)
+    try {
+      const result = await run(vendor, controller.signal)
+      clearCooling(state, vendor)
+      return { result, vendor, attempts, skipped }
+    } catch (error) {
+      if (ranOut) {
+        exhausted = true
+        lastError = providerError(
+          `${kind} fallback budget (${budgetMs}ms) ran out while ${vendor} was still working`,
+          'WEB_FETCH_TIMEOUT',
+        )
+        break
+      }
+      const code = error?.code ?? 'WEB_PROVIDER_ERROR'
+      if (TERMINAL_CODES.has(code) || NON_RETRYABLE_CODES.has(code)) throw error
+      attempts.push({ vendor, code })
+      markCooling(state, kind, vendor, code)
+      lastError = error
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', forwardAbort)
+    }
+  }
+
+  if (lastError === undefined && attempts.length === 0 && skipped.length > 0) {
+    const detail = skipped
+      .map((entry) => `${entry.vendor} ${Math.max(1, Math.ceil((entry.until - Date.now()) / 1000))}s (${entry.code})`)
+      .join(', ')
+    lastError = providerError(`every ${kind} backend is cooling down: ${detail}`, skipped[0].code)
+  }
+  const error = lastError ?? providerError(
+    exhausted
+      ? `${kind} fallback budget (${budgetMs}ms) ran out before any backend answered`
+      : `no ${kind} backend is configured`,
+    exhausted ? 'WEB_FETCH_TIMEOUT' : 'WEB_PROVIDER_BAD_REQUEST',
+  )
+  error.attempts = attempts
+  error.skipped = skipped
+  error.exhausted = exhausted
+  throw error
 }
 
 /* ---------------------------------------------------------------- adapters -- */
@@ -830,10 +1026,23 @@ function createSearchProvider(ctx, state) {
     },
     async search(request, signal) {
       const settings = state.settings
-      const vendor = SEARCH_VENDOR[settings.search.backend] ?? SEARCH_VENDOR.tavily
       const notices = []
-      const result = await vendor(ctx, settings, request, signal, notices)
-      if (result.sources.length === 0) notices.push(`${settings.search.backend} returned no results for this query`)
+      const { result, vendor, attempts, skipped } = await runChain({
+        state,
+        settings,
+        kind: 'search',
+        signal,
+        // Notices from a failed hop must not leak into the answer the next
+        // vendor produces, so each hop collects its own and merges on success.
+        run: async (name, hop) => {
+          const hopNotices = []
+          const result = await SEARCH_VENDOR[name](ctx, settings, request, hop, hopNotices)
+          notices.push(...hopNotices)
+          return result
+        },
+      })
+      pushFallbackNotices(notices, attempts, skipped, vendor)
+      if (result.sources.length === 0) notices.push(`${vendor} returned no results for this query`)
       return {
         content: composeAnswer(result.answer, notices),
         sources: result.sources,
@@ -851,13 +1060,21 @@ function createFetchProvider(ctx, state) {
     },
     async fetch(request, signal) {
       const settings = state.settings
-      const vendor = FETCH_VENDOR[settings.fetch.backend] ?? FETCH_VENDOR.firecrawl
       const notices = []
       try {
-        return withNotices(await vendor(ctx, settings, request, signal, notices), notices)
+        const { result, vendor, attempts, skipped } = await runChain({
+          state,
+          settings,
+          kind: 'fetch',
+          signal,
+          run: (name, hop) => FETCH_VENDOR[name](ctx, settings, request, hop),
+        })
+        pushFallbackNotices(notices, attempts, skipped, vendor)
+        return withNotices(result, notices)
       } catch (error) {
         if (!settings.fetch.options.fallbackToHttp) throw error
         if (error?.code === 'WEB_ABORTED' || signal?.aborted) throw error
+        pushFallbackNotices(notices, error?.attempts, error?.skipped, undefined)
         const result = await localFetch(settings, request, signal)
         return withNotices(result, [...notices, `fell back to a direct HTTP fetch: ${error?.code ?? 'error'}`])
       }
@@ -906,8 +1123,9 @@ function createStateRoutes(ctx, state) {
   }
 
   const snapshot = () => ({
-    search: { backend: state.settings.search.backend },
-    fetch: { backend: state.settings.fetch.backend },
+    search: { backend: state.settings.search.backend, fallbackOrder: state.settings.search.fallbackOrder },
+    fetch: { backend: state.settings.fetch.backend, fallbackOrder: state.settings.fetch.fallbackOrder },
+    fallback: { budgetMs: state.settings.fallback.budgetMs, cooling: activeCooling(state) },
     keys: state.keys,
     stateFile: state.storage ?? stateFileCandidates()[0],
   })
@@ -940,6 +1158,7 @@ function createStateRoutes(ctx, state) {
           throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
         }
         await credentials.set(credentialRef(vendor), value)
+        clearCooling(state, vendor)
       }
       if (body.clearKey && typeof body.clearKey === 'object') {
         const vendor = oneOf(body.clearKey.vendor, VENDORS, '')
@@ -949,6 +1168,7 @@ function createStateRoutes(ctx, state) {
           throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
         }
         await credentials.unset(credentialRef(vendor))
+        clearCooling(state, vendor)
       }
       state.settings = mergeSettings(state.settings, body)
       const persistence = persistSettings(state.settings)
@@ -989,7 +1209,7 @@ function createCreditsRoutes(ctx, state) {
 
 export function apply(ctx, config) {
   const { settings, storage } = loadSettings(config)
-  const state = { settings, storage, keys: {} }
+  const state = { settings, storage, keys: {}, cooldowns: new Map() }
   ctx.web.registerSearchProvider(createSearchProvider(ctx, state))
   ctx.web.registerFetchProvider(createFetchProvider(ctx, state))
   try {
