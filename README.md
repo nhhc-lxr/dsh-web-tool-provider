@@ -127,6 +127,7 @@ FetchResult  = { url: string; statusCode: number; body: { kind: 'text' | 'html';
 - `index.js`：两层设置 + 归一化层 + 回退链（分类/冷却/预算）+ 两个 provider + 两条 Host 路由，零第三方依赖。
 - `client.js`：设置页（分段选择 + 回退标签 + 三家密钥），控件用 DSH UI primitives 并带原生兜底。
 - `node test/smoke.mjs`：25 项离线测试。
+- `node scripts/check-keys.mjs`：检查 `client.js` 里用到的文案 key 都在词典里。
 
 > 改完代码需要**重启一次** Harness 才会加载新的 host 实现；设置页刷新页面即可。
 
