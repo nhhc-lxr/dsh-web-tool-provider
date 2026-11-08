@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "网页工具后端（Tavily · Exa · Firecrawl）",
-    "description": "在设置页里选择 web_search 与 web_fetch 的后端（Tavily / Exa / Firecrawl）并保存各自的密钥；后端失败时抓取退回无需密钥的本地抓取。"
+    "title": "网页工具后端",
+    "description": "web_search 与 web_fetch 的后端与密钥。"
   }
 }

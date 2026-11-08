@@ -22,9 +22,6 @@ window.__ModuleLoader__.load({
 
     const DICT = {
       en: {
-        tab: 'Web tools',
-        title: 'Web tool provider',
-        subtitle: 'One backend serves both web_search and web_fetch. When it fails, the next vendor in the chain is tried.',
         backends: 'Backends',
         searchBackend: 'web_search',
         fetchBackend: 'web_fetch',
@@ -54,9 +51,6 @@ window.__ModuleLoader__.load({
         creditsUnsupported: 'no quota API',
       },
       zh: {
-        tab: '网页工具',
-        title: '网页工具后端',
-        subtitle: '一个后端同时服务 web_search 与 web_fetch；失败时自动按顺序换下一个。',
         backends: '后端选择',
         searchBackend: 'web_search',
         fetchBackend: 'web_fetch',
@@ -119,50 +113,64 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------- styles -- */
 
     const styles = {
-      page: { padding: '4px 0 28px', maxWidth: 720, color: 'var(--dsw-alias-label-primary)' },
-      title: { margin: 0, fontSize: 15, fontWeight: 600, lineHeight: '22px' },
-      subtitle: {
-        margin: '4px 0 16px',
-        fontSize: 12,
-        lineHeight: 1.6,
+      // The detail page already renders the bundle title and description, so this
+      // block starts straight at the fields and follows the native detail layout:
+      // stacked sections, ~44px rows, hairline dividers, no card of its own.
+      page: { display: 'flex', flexDirection: 'column', color: 'var(--dsw-alias-label-primary)' },
+      card: { display: 'flex', flexDirection: 'column', marginBottom: 32 },
+      cardTitle: { margin: '0 0 4px', fontSize: 14, fontWeight: 500, lineHeight: '20px' },
+      block: { display: 'flex', flexDirection: 'column' },
+      row: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 16,
+        minHeight: 44,
+        padding: '8px 2px',
+        borderBottom: '0.5px solid var(--dsw-alias-border-l2)',
+      },
+      label: {
+        flex: '0 0 96px',
+        fontSize: 13,
+        lineHeight: '20px',
         color: 'var(--dsw-alias-label-secondary)',
+        fontFamily: 'var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
       },
-      card: {
-        border: '1px solid var(--dsw-alias-border-l1)',
-        borderRadius: 12,
-        background: 'var(--dsw-alias-bg-layer-1)',
-        padding: '14px 16px 16px',
-        marginBottom: 12,
-      },
-      cardTitle: {
-        margin: '0 0 12px',
-        fontSize: 12,
-        fontWeight: 600,
-        letterSpacing: '0.02em',
-        color: 'var(--dsw-alias-label-secondary)',
-        textTransform: 'uppercase',
-      },
-      block: { display: 'grid', gap: 8, padding: '8px 0' },
-      blockDivider: { borderTop: '1px solid var(--dsw-alias-border-l1)' },
-      row: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32 },
-      label: { flex: '0 0 96px', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontFamily: 'ui-monospace, monospace' },
       control: { flex: '1 1 auto', minWidth: 0 },
-      subrow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', paddingLeft: 108 },
-      caption: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' },
-      chain: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', fontFamily: 'ui-monospace, monospace' },
-      cooling: { margin: '4px 0 0', paddingLeft: 108, fontSize: 11, color: 'var(--dsw-alias-state-warning-primary)' },
+      subrow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        flexWrap: 'wrap',
+        padding: '8px 2px 8px 108px',
+        borderBottom: '0.5px solid var(--dsw-alias-border-l2)',
+      },
+      caption: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' },
+      chain: {
+        fontSize: 12,
+        color: 'var(--dsw-alias-label-tertiary)',
+        fontFamily: 'var(--dsw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
+      },
+      cooling: {
+        margin: 0,
+        padding: '8px 2px 8px 108px',
+        borderBottom: '0.5px solid var(--dsw-alias-border-l2)',
+        fontSize: 12,
+        color: 'var(--dsw-alias-state-warning-primary)',
+      },
       keyRow: {
         display: 'grid',
         gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1.3fr) auto',
         alignItems: 'center',
-        gap: 12,
-        minHeight: 40,
-        padding: '4px 0',
+        gap: 16,
+        minHeight: 44,
+        padding: '8px 2px',
+        borderBottom: '0.5px solid var(--dsw-alias-border-l2)',
       },
       keyIdent: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
-      vendor: { fontSize: 12, fontWeight: 600 },
+      vendor: { fontSize: 13, fontWeight: 500 },
       keyStatus: {
-        fontSize: 11,
+        fontSize: 12,
+        lineHeight: '20px',
         color: 'var(--dsw-alias-label-secondary)',
         whiteSpace: 'nowrap',
         overflow: 'hidden',
@@ -170,11 +178,11 @@ window.__ModuleLoader__.load({
       },
       keyBody: { display: 'flex', alignItems: 'center', minWidth: 0 },
       keyActions: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' },
-      credits: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'nowrap' },
+      credits: { fontSize: 12, lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)', whiteSpace: 'nowrap' },
       note: { margin: '8px 0 0', fontSize: 12, lineHeight: 1.6 },
       error: { color: 'var(--dsw-alias-state-error-primary)' },
       ok: { color: 'var(--dsw-alias-state-success-primary)' },
-      empty: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' },
+      empty: { margin: 0, padding: '8px 2px', fontSize: 13, color: 'var(--dsw-alias-label-secondary)' },
     }
 
     /* ---------------------------------------------------------- controls -- */
@@ -626,18 +634,15 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { style: styles.page },
-        h('h2', { style: styles.title }, t('title')),
-        h('p', { style: styles.subtitle }, t('subtitle')),
         h(
           'div',
           { style: styles.card },
           h('h3', { style: styles.cardTitle }, t('backends')),
           backendBlock('search', 'searchBackend'),
-          h('div', { style: styles.blockDivider }),
           backendBlock('fetch', 'fetchBackend'),
           cooling.length === 0
             ? null
-            : h('p', { style: styles.cooling }, `${t('cooling')}: ${cooling.join(' · ')}`),
+            : h('div', { style: styles.cooling }, `${t('cooling')}: ${cooling.join(' · ')}`),
         ),
         h('div', { style: styles.card }, h('h3', { style: styles.cardTitle }, t('keys')), ...keyRows),
         notice === '' ? null : h('p', { style: { ...styles.note, ...styles.ok } }, notice),
@@ -645,18 +650,22 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // The Plugins page owns plugin configuration: a bundle renders its own form
+    // between the description and the row list of its detail page. The key is
+    // the bundle's package name, which is what `plugins.bundle.config` matches
+    // against the open package.
+    const BUNDLE_NAME = 'dsh-web-tool-provider'
+
     return {
       inject: ['slots'],
       apply(ctx) {
-        ctx.slots.inject('settings.plugins.tab', () =>
+        ctx.slots.inject('plugins.bundle.config', () =>
           ctx.slots.register(
             {
-              name: 'settings.plugins.tab',
-              id: 'web-tool-provider',
-              order: 65,
-              label: () => createTranslate(ctx)('tab'),
+              name: 'plugins.bundle.config',
+              key: BUNDLE_NAME,
             },
-            (props) => h(ProviderPage, { ...props, ctx }),
+            (props) => (props.view === 'page' ? h(ProviderPage, { ...props, ctx }) : null),
           ),
         )
       },

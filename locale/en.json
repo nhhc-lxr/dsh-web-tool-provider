@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Web Tool Provider (Tavily · Exa · Firecrawl)",
-    "description": "Pick the backend behind web_search and web_fetch — Tavily, Exa or Firecrawl — and store each key from a settings page, with a credential-free local fetch fallback."
+    "title": "Web tools backend",
+    "description": "Backends and keys for web_search and web_fetch."
   }
 }
