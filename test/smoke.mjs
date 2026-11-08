@@ -47,6 +47,13 @@ function harness(config = {}, { credentials } = {}) {
     },
     webServer: { register: (route) => (routes.push(route), () => {}) },
     get: (name) => (name === 'credentials' ? credentials : undefined),
+    // The host settings service is optional: this stub keeps the pre-settings
+    // path (the plugin-owned state file) under test. A dedicated harness below
+    // mounts a fake form to cover the service path.
+    // Route and provider registrations are mounted inside effects so a reload
+    // releases them; this stub runs the callback immediately.
+    effect: (callback) => (callback(), () => {}),
+    inject: () => {},
   }
   mod.apply(ctx, config)
   return { registry, routes, route: routes[0], creditsRoute: routes[1] }
@@ -454,6 +461,211 @@ await check('credits: tavily is a limit minus usage, firecrawl is direct, exa is
 await check('the state route refuses a foreign origin', async () => {
   const { route } = harness({})
   assert.equal((await call(route, { origin: 'https://evil.test' })).status, 403)
+})
+
+await check('the form lives on the Plugins page under the bundle package name', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+
+  // Stand in for the browser seams the module touches at load time: the module
+  // loader hands back the definition, React is only reached through
+  // createElement (nothing renders here), and the primitives package is the one
+  // dependency allowed to be missing.
+  const stubRequire = (id) => {
+    if (id !== 'react') throw new Error(`unexpected require: ${id}`)
+    return {
+      createElement: (type, props, ...children) => ({ type, props, children }),
+      useMemo: (factory) => factory(),
+      useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+      useCallback: (callback) => callback,
+      useRef: (initial) => ({ current: initial }),
+      useEffect: () => {},
+    }
+  }
+
+  let definition
+  new Function('window', 'require', source)(
+    { __ModuleLoader__: { load: (value) => (definition = value) } },
+    stubRequire,
+  )
+  assert.equal(definition.id, pkg.name)
+
+  const injected = []
+  const registered = []
+  definition.factory(stubRequire).apply({
+    slots: {
+      inject: (name, register) => (injected.push(name), register()),
+      register: (options, component) => (registered.push({ options, component }), () => {}),
+    },
+  })
+
+  // The Plugins page declares `plugins.bundle.config` keyed by package name; a
+  // settings tab would land in Settings instead, which is what this replaced.
+  assert.deepEqual(injected, ['plugins.bundle.config'])
+  assert.equal(registered.length, 1)
+  const { options, component } = registered[0]
+  assert.equal(options.name, 'plugins.bundle.config')
+  assert.equal(options.key, pkg.name, 'the key must be the bundle package name')
+  assert.equal(component({ view: 'summary' }), null, 'only the full page carries the form')
+  assert.equal(typeof component({ view: 'page', ctx: {} }).type, 'function')
+})
+
+await check('the bundle patch mounts this package so the Plugins page can list it', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+  const quoted = pkg.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  assert.match(patch, new RegExp(`name: '${quoted}'`), 'the inserted row must name this package')
+})
+
+await check('the profile row exports a Config form the settings service can render', async () => {
+  const schema = mod.Config
+  assert.equal(typeof schema.toJSON, 'function')
+  assert.ok(Object.keys(schema.toJSON().refs).length > 0, 'a form needs a serialized schema')
+
+  // Only fields a user owns carry the volatile marker: the settings service
+  // refuses every other path, so an unmarked field cannot be edited from a form.
+  const volatile = Object.entries(schema.dict)
+    .filter(([, field]) => field.meta?.volatile === true)
+    .map(([key]) => key)
+    .sort()
+  assert.deepEqual(volatile, [
+    'exaApiKey',
+    'excludeDomains',
+    'fallbackBudgetMs',
+    'fallbackMaxBytes',
+    'fallbackMaxChars',
+    'fallbackMaxRedirects',
+    'fallbackTimeoutMs',
+    'fallbackToHttp',
+    'fetchBackend',
+    'fetchFallbackOrder',
+    'firecrawlApiKey',
+    'includeDomains',
+    'searchBackend',
+    'searchFallbackOrder',
+    'tavilyApiKey',
+  ])
+
+  // Keys are form fields so the phone sheet can collect them, but they are
+  // declared secret: the settings wire layer strips them from every response
+  // and only reports whether each one is set.
+  for (const key of ['tavilyApiKey', 'exaApiKey', 'firecrawlApiKey']) {
+    assert.equal(schema.dict[key].meta?.volatile, true, `${key} must be a form field`)
+    assert.equal(schema.dict[key].meta?.role, 'secret', `${key} must never leave the process`)
+  }
+  assert.equal(schema.dict.searchBackend.meta.default, 'tavily')
+  assert.equal(schema.dict.fetchBackend.meta.default, 'firecrawl')
+})
+
+await check('a host with the settings service saves edits through the profile form', async () => {
+  const updates = []
+  const routes = []
+  const value = { searchBackend: 'tavily', fetchBackend: 'firecrawl' }
+  const settings = {
+    documentPath: 'C:/profile/cordis.patch.yml',
+    describe: () => [{ ns: 'web-tool-provider', value, revision: 4, user: {} }],
+    update: async (ns, patch, revision) => updates.push({ ns, patch, revision }),
+  }
+  const ctx = {
+    web: { registerSearchProvider: () => () => {}, registerFetchProvider: () => () => {} },
+    webServer: { register: (route) => (routes.push(route), () => {}) },
+    get: () => undefined,
+    loader: {
+      entries: () => [{ options: { name: 'dsh-web-tool-provider', id: 'web-tool-provider' }, fiber: undefined }],
+      await: () => Promise.resolve(),
+    },
+    effect: (callback) => (callback(), () => {}),
+    inject: (names, callback) => callback({ settings }),
+  }
+  mod.apply(ctx, {})
+
+  const result = await call(routes[0], { method: 'POST', body: { search: { backend: 'exa' } } })
+  assert.equal(result.status, 200)
+  assert.equal(updates.length, 1, 'the edit must reach the profile document')
+  assert.equal(updates[0].ns, 'web-tool-provider')
+  assert.equal(updates[0].revision, 4, 'the revision guards against a stale form')
+  assert.equal(updates[0].patch.searchBackend, 'exa')
+  // The settings service rejects non-volatile paths; shipping one in the patch
+  // would make every save fail, so the writer only carries form fields.
+  for (const key of Object.keys(updates[0].patch)) {
+    assert.equal(mod.Config.dict[key].meta?.volatile, true, `${key} must be a form field`)
+  }
+  assert.equal(result.payload.persistence.location, 'C:/profile/cordis.patch.yml')
+})
+
+await check('a parsed Config snapshot (volatile references included) becomes plain defaults', async () => {
+  // Cordis hands apply() the schema output, where every volatile field is a
+  // cosmokit reference rather than a string. Reading it raw would hand those
+  // wrappers to the provider layer.
+  const parsed = mod.Config({
+    searchBackend: 'exa',
+    searchFallbackOrder: ['tavily'],
+    fallbackBudgetMs: 45000,
+    fallbackToHttp: false,
+  })
+  const { route } = harness(parsed)
+  const result = await call(route, {})
+  assert.equal(result.payload.search.backend, 'exa')
+  assert.deepEqual(result.payload.search.fallbackOrder, ['tavily'])
+  assert.equal(result.payload.fallback.budgetMs, 45000)
+})
+
+await check('the HTTP form reaches the same fields the native sheet does', async () => {
+  const { route } = harness({})
+  const result = await call(route, {
+    method: 'POST',
+    body: {
+      fallback: { budgetMs: 55000, maxRedirects: 2 },
+      search: { options: { includeDomains: ['Example.COM', 'https://a.test/x'] } },
+      fetch: { options: { fallbackToHttp: false } },
+    },
+  })
+  assert.equal(result.status, 200)
+  assert.equal(result.payload.fallback.budgetMs, 55000)
+  const saved = JSON.parse(readFileSync(result.payload.persistence.location, 'utf8'))
+  assert.equal(saved.fallback.budgetMs, 55000)
+  assert.equal(saved.fallback.maxRedirects, 2)
+  assert.deepEqual(saved.search.options.includeDomains, ['example.com', 'a.test'])
+  assert.equal(saved.fetch.options.fallbackToHttp, false)
+})
+
+await check('a key typed on the desktop page reaches the same form the phone writes', async () => {
+  const updates = []
+  const routes = []
+  const value = { searchBackend: 'tavily', fetchBackend: 'firecrawl' }
+  const settings = {
+    documentPath: 'C:/profile/cordis.patch.yml',
+    describe: () => [{ ns: 'web-tool-provider', value, revision: 4, user: {} }],
+    update: async (ns, patch, revision) => updates.push({ ns, patch, revision }),
+  }
+  const ctx = {
+    web: { registerSearchProvider: () => () => {}, registerFetchProvider: () => () => {} },
+    webServer: { register: (route) => (routes.push(route), () => {}) },
+    get: () => undefined,
+    loader: {
+      entries: () => [{ options: { name: 'dsh-web-tool-provider', id: 'web-tool-provider' }, fiber: undefined }],
+      await: () => Promise.resolve(),
+    },
+    effect: (callback) => (callback(), () => {}),
+    inject: (names, callback) => callback({ settings }),
+  }
+  mod.apply(ctx, {})
+
+  // One store for both surfaces: the phone sheet edits `exaApiKey` in this
+  // document, so the desktop page must write the same field instead of the
+  // credentials service, or the two would silently disagree.
+  const result = await call(routes[0], { method: 'POST', body: { setKey: { vendor: 'exa', value: 'exa-secret' } } })
+  assert.equal(result.status, 200)
+  assert.deepEqual(updates, [{ ns: 'web-tool-provider', patch: { exaApiKey: 'exa-secret' }, revision: 4 }])
+})
+
+await check('the same edit still lands in the state file without a settings service', async () => {
+  const { route } = harness({})
+  const result = await call(route, { method: 'POST', body: { fetch: { backend: 'exa' } } })
+  assert.equal(result.status, 200)
+  assert.equal(result.payload.persistence.persisted, true)
+  const saved = JSON.parse(readFileSync(result.payload.persistence.location, 'utf8'))
+  assert.equal(saved.fetch.backend, 'exa')
 })
 
 globalThis.fetch = originalFetch

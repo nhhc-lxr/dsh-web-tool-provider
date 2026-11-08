@@ -10,8 +10,10 @@
 # the settings page writes those two fields through the config editor.
 #
 # `searchFallbackOrder` / `fetchFallbackOrder` are only first-run defaults: the
-# chain is `backend` first, then this order, deduped. The settings page stores
-# its own copy in the plugin state file, which wins over this YAML.
+# chain is `backend` first, then this order, deduped. The Plugins page edits the
+# volatile fields of this row through the host settings service, which writes
+# them into the profile document — this file is the bundle default, not the
+# user's copy.
 - insert:
     - id: web-tool-provider
       name: 'dsh-web-tool-provider'

@@ -19,16 +19,22 @@
  *   GET  /web-tool-provider/state  -> layered settings, capabilities, key state
  *   POST /web-tool-provider/state  -> edit any layer, store or clear a key
  *
- * Keys persist in `ctx.credentials`; settings persist in a plugin-owned JSON
- * file (never the config editor: re-applying the profile re-registers the route
- * and a duplicate path is a hard error).
+ * Keys persist in `ctx.credentials`. Settings persist in the profile document
+ * through the host settings service: `Config` below declares which fields a
+ * form may edit (the Plugins page here, the native plugin sheet in dsh-go), and
+ * the pre-settings state file is only read once, to import values saved before
+ * this row became a form.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import Schema from '@deepseek-ai/schemastery'
 
 const PLUGIN = 'web-tool-provider'
+const PACKAGE = 'dsh-web-tool-provider'
+/** Carried by every cosmokit volatile reference; Config output is full of them. */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 const ROUTE = '/web-tool-provider/state'
 const CREDITS_ROUTE = '/web-tool-provider/credits'
 const PROVIDER_ID = 'web-tool'
@@ -81,6 +87,63 @@ const COOLDOWN_MS = {
 
 export const name = PLUGIN
 export const inject = ['web', 'webServer']
+
+/* ------------------------------------------------------------------ config -- */
+
+/** One vendor id as a schema leaf, so every enum field validates the same list. */
+const vendorField = Schema.union(VENDORS.map((id) => Schema.const(id)))
+
+/**
+ * The profile row's Config. Fields are flat camelCase because that is what the
+ * profile patch has always carried; the settings service renders exactly the
+ * `volatile()` ones as a form, and `autoGenerate` stays on so the dsh-go plugin
+ * sheet can draw those same fields natively.
+ *
+ * Descriptions are Chinese on purpose: the settings service copies them into
+ * the form schema, and that label is what both the desktop page and the phone
+ * sheet show. Keys are `role('secret')`, so `describe({redactSecrets:true})`
+ * removes them before they leave this process while `secrets` still reports
+ * whether each one is set.
+ */
+export const Config = Schema.object({
+  searchBackend: vendorField.description('搜索优先使用的后端').default('tavily').volatile(),
+  searchFallbackOrder: Schema.array(vendorField).description('搜索后端失败后依次尝试').default([]).volatile(),
+  fetchBackend: vendorField.description('抓取优先使用的后端').default('firecrawl').volatile(),
+  fetchFallbackOrder: Schema.array(vendorField).description('抓取后端失败后依次尝试').default([]).volatile(),
+  includeDomains: Schema.array(Schema.string()).description('只搜这些域名，留空不限').default([]).volatile(),
+  excludeDomains: Schema.array(Schema.string()).description('排除这些域名').default([]).volatile(),
+  fallbackToHttp: Schema.boolean().description('厂商失败后用普通 HTTP 兜底').default(true).volatile(),
+  fallbackBudgetMs: Schema.number().description('一次调用在整条链上的总预算（毫秒）').default(60000).volatile(),
+  fallbackTimeoutMs: Schema.number().description('单次抓取超时（毫秒）').default(20000).volatile(),
+  fallbackMaxChars: Schema.number().description('单页保留的最大字符数').default(100000).volatile(),
+  fallbackMaxBytes: Schema.number().description('单页读取的最大字节数').default(5000000).volatile(),
+  fallbackMaxRedirects: Schema.number().description('普通 HTTP 最多跟随的重定向次数').default(5).volatile(),
+  fallbackUserAgent: Schema.string().description('普通 HTTP 使用的 User-Agent').default(`${PLUGIN}/0.4.0`),
+
+  tavilyBaseURL: Schema.string().default('https://api.tavily.com'),
+  tavilyTimeoutMs: Schema.number().default(20000),
+  tavilyMaxChars: Schema.number().default(100000),
+  tavilyApiKey: Schema.string().description('Tavily API 密钥').role('secret').volatile(),
+  tavilyApiKeyEnv: Schema.string().default(CREDENTIAL_REF.tavily),
+  tavilyTopic: Schema.union(['general', 'news', 'finance'].map((id) => Schema.const(id))).default('general'),
+  tavilySearchDepth: Schema.union(['basic', 'fast', 'advanced'].map((id) => Schema.const(id))).default('basic'),
+
+  exaBaseURL: Schema.string().default('https://api.exa.ai'),
+  exaTimeoutMs: Schema.number().default(20000),
+  exaMaxChars: Schema.number().default(100000),
+  exaApiKey: Schema.string().description('Exa API 密钥').role('secret').volatile(),
+  exaApiKeyEnv: Schema.string().default(CREDENTIAL_REF.exa),
+  exaSearchType: Schema.union(['auto', 'lite', 'deep'].map((id) => Schema.const(id))).default('auto'),
+
+  firecrawlBaseURL: Schema.string().default('https://api.firecrawl.dev'),
+  firecrawlTimeoutMs: Schema.number().default(30000),
+  firecrawlMaxChars: Schema.number().default(100000),
+  firecrawlApiKey: Schema.string().description('Firecrawl API 密钥').role('secret').volatile(),
+  firecrawlApiKeyEnv: Schema.string().default(CREDENTIAL_REF.firecrawl),
+  firecrawlApiVersion: Schema.union(['v1', 'v2'].map((id) => Schema.const(id))).default('v2'),
+  firecrawlMainContent: Schema.boolean().default(true),
+  firecrawlMaxAge: Schema.number().default(172800000),
+})
 
 /* ------------------------------------------------------------------ errors -- */
 
@@ -184,8 +247,19 @@ function vendorList(value) {
 
 /* ---------------------------------------------------------------- settings -- */
 
+/** Detach cosmokit volatile references so the rest of the file sees plain values. */
+function plainConfig(value) {
+  if (value !== null && typeof value === 'object' && VOLATILE_WRITE in value) return plainConfig(value.get())
+  if (Array.isArray(value)) return value.map(plainConfig)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, plainConfig(child)]))
+  }
+  return value
+}
+
 /** Static Config supplies first-run defaults; the state file overrides them. */
-function defaultsFromConfig(config) {
+function defaultsFromConfig(raw) {
+  const config = plainConfig(raw ?? {})
   return {
     search: {
       backend: oneOf(config.searchBackend, VENDORS, 'tavily'),
@@ -263,6 +337,34 @@ function mergeSettings(base, patch) {
   }
   if (Array.isArray(patch.fetch?.fallbackOrder)) {
     next.fetch.fallbackOrder = vendorList(patch.fetch.fallbackOrder)
+  }
+
+  const searchOptions = patch.search?.options
+  if (searchOptions !== null && typeof searchOptions === 'object') {
+    if (Array.isArray(searchOptions.includeDomains)) {
+      next.search.options.includeDomains = domainList(searchOptions.includeDomains)
+    }
+    if (Array.isArray(searchOptions.excludeDomains)) {
+      next.search.options.excludeDomains = domainList(searchOptions.excludeDomains)
+    }
+  }
+  const fetchOptions = patch.fetch?.options
+  if (fetchOptions !== null && typeof fetchOptions === 'object') {
+    next.fetch.options.fallbackToHttp = asBoolean(
+      fetchOptions.fallbackToHttp,
+      next.fetch.options.fallbackToHttp,
+    )
+  }
+
+  // The fallback budget and caps are form fields too, so an HTTP caller gets the
+  // same reach as the native sheet in dsh-go.
+  const fallback = patch.fallback
+  if (fallback !== null && typeof fallback === 'object') {
+    next.fallback.budgetMs = asInteger(fallback.budgetMs, next.fallback.budgetMs, 1000, MAX_TIMER_MS)
+    next.fallback.timeoutMs = asInteger(fallback.timeoutMs, next.fallback.timeoutMs, 1000, MAX_TIMER_MS)
+    next.fallback.maxChars = asInteger(fallback.maxChars, next.fallback.maxChars, 1000, 5000000)
+    next.fallback.maxBytes = asInteger(fallback.maxBytes, next.fallback.maxBytes, 1000, 50000000)
+    next.fallback.maxRedirects = asInteger(fallback.maxRedirects, next.fallback.maxRedirects, 0, 20)
   }
 
   return next
@@ -346,15 +448,114 @@ function stateFileCandidates() {
 
 function loadSettings(config) {
   const defaults = defaultsFromConfig(config)
+  const legacy = legacyState()
+  return legacy === undefined
+    ? { settings: defaults, storage: undefined }
+    : { settings: mergeSettings(defaults, legacy.raw), storage: legacy.storage }
+}
+
+/** The plugin-owned state file written before the settings service existed. */
+function legacyState() {
   for (const file of stateFileCandidates()) {
     try {
-      const raw = JSON.parse(readFileSync(file, 'utf8'))
-      return { settings: mergeSettings(defaults, raw), storage: file }
+      return { raw: JSON.parse(readFileSync(file, 'utf8')), storage: file }
     } catch {
       /* try the next candidate */
     }
   }
-  return { settings: defaults, storage: undefined }
+  return undefined
+}
+
+/** Flatten the editable layers back into the volatile fields the form declares. */
+function configFromSettings(settings) {
+  return {
+    searchBackend: settings.search.backend,
+    searchFallbackOrder: [...settings.search.fallbackOrder],
+    fetchBackend: settings.fetch.backend,
+    fetchFallbackOrder: [...settings.fetch.fallbackOrder],
+    includeDomains: [...settings.search.options.includeDomains],
+    excludeDomains: [...settings.search.options.excludeDomains],
+    fallbackToHttp: settings.fetch.options.fallbackToHttp,
+    fallbackBudgetMs: settings.fallback.budgetMs,
+    fallbackTimeoutMs: settings.fallback.timeoutMs,
+    fallbackMaxChars: settings.fallback.maxChars,
+    fallbackMaxBytes: settings.fallback.maxBytes,
+    fallbackMaxRedirects: settings.fallback.maxRedirects,
+  }
+}
+
+/** The Loader row this fiber belongs to; that id is the settings namespace. */
+function ownEntryId(ctx) {
+  let fallback
+  try {
+    for (const entry of ctx.loader.entries()) {
+      if (entry.options.name !== PACKAGE) continue
+      const id = entry.options.id
+      if (typeof id !== 'string' || id === '') continue
+      if (entry.fiber === ctx.fiber) return id
+      if (entry.disabled !== true && fallback === undefined) fallback = id
+    }
+  } catch {
+    return undefined
+  }
+  return fallback
+}
+
+/**
+ * A small face over the host settings service, scoped to this row. `get` is
+ * cheap enough for a request handler; `update` writes the patch into the
+ * profile document and remounts the row, so the next request sees the values
+ * the form just saved.
+ *
+ * `describe()` is called without `redactSecrets` on purpose: this call stays
+ * inside this process, and a redacted read would hand the resolver an empty
+ * key for every vendor the user filled in on the phone. Responses leaving this
+ * process are redacted by the settings wire layer, not here.
+ */
+function createSettingsFace(settings, ns) {
+  const describe = () => {
+    try {
+      return settings.describe().find((row) => row.ns === ns)
+    } catch {
+      return undefined
+    }
+  }
+  const face = {
+    documentPath: () => {
+      try {
+        return settings.documentPath
+      } catch {
+        return undefined
+      }
+    },
+    get: () => {
+      const row = describe()
+      return row === undefined ? undefined : { value: row.value, revision: row.revision }
+    },
+    update: async (patch, expectedRevision) => {
+      await settings.update(ns, patch, expectedRevision)
+      return face.get()
+    },
+  }
+  return face
+}
+
+/**
+ * Import the pre-settings state file once — only while the row carries no user
+ * values. The file stays on disk as a backup but is never written again: from
+ * here on the profile document is the only place settings are stored.
+ */
+async function importLegacyState(ctx, settings, ns) {
+  const legacy = legacyState()
+  if (legacy === undefined) return
+  await ctx.loader?.await?.()
+  const row = settings.describe({ redactSecrets: true }).find((candidate) => candidate.ns === ns)
+  if (row === undefined) return
+  const user = row.user
+  if (user !== null && typeof user === 'object' && Object.keys(user).length > 0) return
+  const merged = mergeSettings(defaultsFromConfig(row.value), legacy.raw)
+  await settings.update(ns, configFromSettings(merged))
+  ctx.logger?.info?.(`${PLUGIN}: imported ${legacy.storage} into the profile settings`)
 }
 
 function persistSettings(settings) {
@@ -364,8 +565,26 @@ function persistSettings(settings) {
       mkdirSync(dirname(file), { recursive: true })
       const temporary = `${file}.tmp`
       const payload = {
-        search: { backend: settings.search.backend, fallbackOrder: settings.search.fallbackOrder },
-        fetch: { backend: settings.fetch.backend, fallbackOrder: settings.fetch.fallbackOrder },
+        search: {
+          backend: settings.search.backend,
+          fallbackOrder: settings.search.fallbackOrder,
+          options: {
+            includeDomains: settings.search.options.includeDomains,
+            excludeDomains: settings.search.options.excludeDomains,
+          },
+        },
+        fetch: {
+          backend: settings.fetch.backend,
+          fallbackOrder: settings.fetch.fallbackOrder,
+          options: { fallbackToHttp: settings.fetch.options.fallbackToHttp },
+        },
+        fallback: {
+          budgetMs: settings.fallback.budgetMs,
+          timeoutMs: settings.fallback.timeoutMs,
+          maxChars: settings.fallback.maxChars,
+          maxBytes: settings.fallback.maxBytes,
+          maxRedirects: settings.fallback.maxRedirects,
+        },
         updatedAt: new Date().toISOString(),
       }
       writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`)
@@ -376,6 +595,22 @@ function persistSettings(settings) {
     }
   }
   return { persisted: false, reason: `write-failed: ${lastError?.message ?? 'no writable location'}` }
+}
+
+/**
+ * Persist through the profile form when the settings service is mounted, and
+ * fall back to the hand-rolled file on hosts that do not have one. A rejected
+ * edit is reported to the page instead of silently vanishing.
+ */
+async function saveSettings(state, settings) {
+  if (state.forms === undefined) return persistSettings(settings)
+  try {
+    const revision = state.forms.get()?.revision
+    await state.forms.update(configFromSettings(settings), revision)
+    return { persisted: true, location: state.forms.documentPath() ?? 'profile settings' }
+  } catch (error) {
+    return { persisted: false, reason: `settings-rejected: ${error?.message ?? String(error)}` }
+  }
 }
 
 /* ----------------------------------------------------------------- helpers -- */
@@ -1118,17 +1353,31 @@ async function readJsonBody(req) {
 }
 
 function createStateRoutes(ctx, state) {
-  const refreshKeys = async () => {
-    state.keys = await describeKeys(ctx, state.settings)
+  /**
+   * The profile form is the source of truth once the settings service is
+   * mounted: another device (dsh-go) writes the same document, so reading
+   * through the form keeps this page from showing a stale backend.
+   */
+  const liveSettings = () => {
+    const row = state.forms?.get()
+    if (row === undefined || row.value === null || typeof row.value !== 'object') return state.settings
+    return defaultsFromConfig(row.value)
   }
 
-  const snapshot = () => ({
-    search: { backend: state.settings.search.backend, fallbackOrder: state.settings.search.fallbackOrder },
-    fetch: { backend: state.settings.fetch.backend, fallbackOrder: state.settings.fetch.fallbackOrder },
-    fallback: { budgetMs: state.settings.fallback.budgetMs, cooling: activeCooling(state) },
-    keys: state.keys,
-    stateFile: state.storage ?? stateFileCandidates()[0],
-  })
+  const refreshKeys = async () => {
+    state.keys = await describeKeys(ctx, liveSettings())
+  }
+
+  const snapshot = () => {
+    const settings = liveSettings()
+    return {
+      search: { backend: settings.search.backend, fallbackOrder: settings.search.fallbackOrder },
+      fetch: { backend: settings.fetch.backend, fallbackOrder: settings.fetch.fallbackOrder },
+      fallback: { budgetMs: settings.fallback.budgetMs, cooling: activeCooling(state) },
+      keys: state.keys,
+      stateFile: state.forms?.documentPath() ?? state.storage ?? stateFileCandidates()[0],
+    }
+  }
 
   const handler = async (req, res) => {
     if (!sameOrigin(req)) {
@@ -1147,34 +1396,54 @@ function createStateRoutes(ctx, state) {
     try {
       const body = await readJsonBody(req)
       const credentialRef = (vendor) => text(state.settings.providers[vendor].apiKeyEnv) || CREDENTIAL_REF[vendor]
+      // Keys typed on either surface have to land in the same place: the
+      // profile form, which is where the phone sheet writes them. Without the
+      // form (older host) fall back to the credentials service.
+      const storeKey = async (vendor, value) => {
+        if (state.forms === undefined) return false
+        const row = state.forms.get()
+        await state.forms.update({ [`${vendor}ApiKey`]: value }, row?.revision)
+        return true
+      }
       if (body.setKey && typeof body.setKey === 'object') {
         const vendor = oneOf(body.setKey.vendor, VENDORS, '')
         const value = text(body.setKey.value)
-        const credentials = ctx.get('credentials')
         if (vendor === '' || value === '') {
           throw providerError('setKey needs a vendor and a non-empty value', 'WEB_PROVIDER_BAD_REQUEST')
         }
-        if (credentials === undefined) {
-          throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
+        if (!(await storeKey(vendor, value))) {
+          const credentials = ctx.get('credentials')
+          if (credentials === undefined) {
+            throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
+          }
+          await credentials.set(credentialRef(vendor), value)
         }
-        await credentials.set(credentialRef(vendor), value)
         clearCooling(state, vendor)
       }
       if (body.clearKey && typeof body.clearKey === 'object') {
         const vendor = oneOf(body.clearKey.vendor, VENDORS, '')
-        const credentials = ctx.get('credentials')
         if (vendor === '') throw providerError('clearKey needs a vendor', 'WEB_PROVIDER_BAD_REQUEST')
-        if (credentials === undefined) {
-          throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
+        if (!(await storeKey(vendor, ''))) {
+          const credentials = ctx.get('credentials')
+          if (credentials === undefined) {
+            throw providerError('the credentials service is not available', 'WEB_PROVIDER_ERROR')
+          }
+          await credentials.unset(credentialRef(vendor))
         }
-        await credentials.unset(credentialRef(vendor))
         clearCooling(state, vendor)
       }
-      state.settings = mergeSettings(state.settings, body)
-      const persistence = persistSettings(state.settings)
-      if (persistence.location !== undefined) state.storage = persistence.location
+      // Saving a key alone must not rewrite the profile document: every write
+      // reloads this row, which would drop the providers a search is using.
+      const touched = ['search', 'fetch', 'fallback'].filter((key) => body[key] !== undefined)
+      let persistence
+      if (touched.length === 0) {
+        state.settings = liveSettings()
+      } else {
+        state.settings = mergeSettings(liveSettings(), body)
+        persistence = await saveSettings(state, state.settings)
+      }
       await refreshKeys()
-      sendJson(res, 200, { ...snapshot(), persistence })
+      sendJson(res, 200, persistence === undefined ? snapshot() : { ...snapshot(), persistence })
     } catch (error) {
       sendJson(res, 400, { error: error?.message ?? String(error), code: error?.code })
     }
@@ -1209,16 +1478,59 @@ function createCreditsRoutes(ctx, state) {
 
 export function apply(ctx, config) {
   const { settings, storage } = loadSettings(config)
-  const state = { settings, storage, keys: {}, cooldowns: new Map() }
-  ctx.web.registerSearchProvider(createSearchProvider(ctx, state))
-  ctx.web.registerFetchProvider(createFetchProvider(ctx, state))
-  try {
-    createStateRoutes(ctx, state)
-    createCreditsRoutes(ctx, state)
-  } catch (error) {
-    // A route already registered for this path means the previous fiber has not
-    // disposed yet. Losing the settings page is survivable; losing the web
-    // backends because this row refused to activate is not.
-    ctx.logger?.warn?.(`${PLUGIN}: settings route unavailable: ${error?.message ?? String(error)}`)
-  }
+  const state = { settings, storage, keys: {}, cooldowns: new Map(), forms: undefined }
+  // Every registration below is released on dispose. An edit from the Plugins
+  // page re-applies this row, and a duplicate route or provider id is a hard
+  // error, so a leak here would break the very page that made the edit.
+  ctx.effect(() => {
+    const disposers = [
+      ctx.web.registerSearchProvider(createSearchProvider(ctx, state)),
+      ctx.web.registerFetchProvider(createFetchProvider(ctx, state)),
+    ]
+    return () => {
+      for (const dispose of disposers) if (typeof dispose === 'function') dispose()
+    }
+  }, `${PLUGIN}: providers`)
+  ctx.effect(() => {
+    const disposers = []
+    for (const [label, mount] of [
+      ['settings', () => createStateRoutes(ctx, state)],
+      ['credits', () => createCreditsRoutes(ctx, state)],
+    ]) {
+      try {
+        disposers.push(mount())
+      } catch (error) {
+        // Losing a page is survivable; losing the web backends is not.
+        ctx.logger?.warn?.(`${PLUGIN}: ${label} route unavailable: ${error?.message ?? String(error)}`)
+      }
+    }
+    return () => {
+      for (const dispose of disposers) if (typeof dispose === 'function') dispose()
+    }
+  }, `${PLUGIN}: routes`)
+
+  // The Plugins page (and dsh-go's native plugin sheet) edit this row through
+  // the host settings service. Without it the state file above stays in charge,
+  // which is exactly the pre-0.14 behaviour.
+  ctx.inject(['settings'], (sctx) => {
+    const ns = ownEntryId(ctx)
+    if (ns === undefined) {
+      ctx.logger?.warn?.(`${PLUGIN}: no profile row for this package; settings stay at the config defaults`)
+      return
+    }
+    state.forms = createSettingsFace(sctx.settings, ns)
+    // describe() only lists rows whose fiber is active, and this one is still
+    // inside apply(), so the first read has to wait for the loader to settle.
+    void (async () => {
+      await ctx.loader?.await?.()
+      const row = state.forms.get()
+      if (row !== undefined && row.value !== null && typeof row.value === 'object') {
+        state.settings = defaultsFromConfig(row.value)
+        state.storage = undefined
+      }
+      await importLegacyState(ctx, sctx.settings, ns)
+    })().catch((error) => {
+      ctx.logger?.warn?.(`${PLUGIN}: could not read the profile form: ${error?.message ?? String(error)}`)
+    })
+  })
 }
